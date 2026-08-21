@@ -95,7 +95,7 @@
       become: false
       run_once: true
       register: snowagent_assumed_role
-      no_log: true
+      no_log: false
 
     - name: Download ACC package from private S3 to execution node
       amazon.aws.s3_object:
