@@ -1,0 +1,251 @@
+---
+- name: Install and configure ServiceNow ACC on Linux from S3
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/snowagent_s3.yaml
+
+  vars:
+    snowagent_policy_group: "{{ policy_group | default('staging') }}"
+    snowagent_config_file: /etc/servicenow/agent-client-collector/acc.yml
+    snowagent_service_name: acc.service
+    snowagent_working_dir: /tmp
+    snowagent_execution_package_dir: /tmp/snowagent-s3
+
+    snowagent_environment: >-
+      {{
+        'staging'
+        if (snowagent_policy_group is regex('local|staging'))
+        else 'production'
+      }}
+
+    snowagent_mid_port: >-
+      {{
+        '8800'
+        if (snowagent_policy_group is regex('local|staging'))
+        else '443'
+      }}
+
+    snowagent_version: >-
+      {{ snowagent_acc_versions[snowagent_environment]['linux'] }}
+
+    snowagent_package_suffix: >-
+      {{
+        '-ubuntu-1804_amd64.deb'
+        if ansible_os_family == 'Debian'
+        else '-x86_64.rpm'
+      }}
+
+    snowagent_package_name: >-
+      {{ snowagent_package_prefix ~ snowagent_version ~ snowagent_package_suffix }}
+
+    snowagent_s3_object: >-
+      {{ snowagent_s3_prefix }}/{{ snowagent_package_name }}
+
+    snowagent_execution_package_file: >-
+      {{ snowagent_execution_package_dir }}/{{ snowagent_package_name }}
+
+    snowagent_install_file: >-
+      {{ snowagent_working_dir }}/{{ snowagent_package_name }}
+
+    snowagent_package_source: >-
+      s3://{{ snowagent_s3_bucket }}/{{ snowagent_s3_object }}
+
+  tasks:
+    - name: Ensure ACC API key was provided by AAP credential
+      ansible.builtin.assert:
+        that:
+          - snowagent_acc_key is defined
+          - snowagent_acc_key | length > 0
+        fail_msg: >-
+          snowagent_acc_key was not provided by the attached AAP credential.
+      no_log: true
+
+    - name: End host for unsupported aarch64 systems
+      ansible.builtin.meta: end_host
+      when: ansible_architecture == "aarch64"
+
+    - name: Ensure ServiceNow sudoers entry exists
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers
+        regexp: '^servicenow.*'
+        line: >-
+          servicenow    ALL=(root)    NOPASSWD:
+          /sbin/dmidecode,/sbin/ss
+        state: present
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Create temporary ACC package directory on execution node
+      ansible.builtin.file:
+        path: "{{ snowagent_execution_package_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Assume read-only S3 artifact role
+      amazon.aws.sts_assume_role:
+        role_arn: "{{ snowagent_s3_role_arn }}"
+        role_session_name: "{{ snowagent_s3_role_session_name }}"
+        region: "{{ snowagent_s3_region }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: snowagent_assumed_role
+      no_log: true
+
+    - name: Download ACC package from private S3 to execution node
+      amazon.aws.s3_object:
+        bucket: "{{ snowagent_s3_bucket }}"
+        object: "{{ snowagent_s3_object }}"
+        dest: "{{ snowagent_execution_package_file }}"
+        mode: get
+        region: "{{ snowagent_s3_region }}"
+        access_key: "{{ snowagent_assumed_role.sts_creds.access_key }}"
+        secret_key: "{{ snowagent_assumed_role.sts_creds.secret_key }}"
+        session_token: "{{ snowagent_assumed_role.sts_creds.session_token }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true
+
+    - name: Copy ACC package from execution node to managed host
+      ansible.builtin.copy:
+        src: "{{ snowagent_execution_package_file }}"
+        dest: "{{ snowagent_install_file }}"
+        mode: "0644"
+
+    - name: Install or upgrade ACC on RPM-based systems
+      ansible.builtin.dnf:
+        name: "{{ snowagent_install_file }}"
+        state: present
+        disable_gpg_check: true
+      when: ansible_os_family == "RedHat"
+      notify: Restart ACC
+
+    - name: Install or upgrade ACC on Debian-based systems
+      ansible.builtin.apt:
+        deb: "{{ snowagent_install_file }}"
+        state: present
+      when: ansible_os_family == "Debian"
+      notify: Restart ACC
+
+    - name: Ensure ACC configuration directory exists
+      ansible.builtin.file:
+        path: /etc/servicenow/agent-client-collector
+        state: directory
+        owner: servicenow
+        group: servicenow
+        mode: "0755"
+
+    - name: Check whether acc.yml already contains encrypted API key
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -Ei '^\s*api-key:\s*"(encrypted:)' \
+          "{{ snowagent_config_file }}"
+      args:
+        executable: /bin/bash
+      register: snowagent_encrypted_key_check
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy ACC configuration when API key is not already encrypted
+      ansible.builtin.template:
+        src: acc.yaml.j2
+        dest: "{{ snowagent_config_file }}"
+        owner: servicenow
+        group: servicenow
+        mode: "0600"
+      when: snowagent_encrypted_key_check.rc != 0
+      notify: Restart ACC
+      no_log: true
+
+    - name: Ensure ACC service is enabled and started
+      ansible.builtin.systemd_service:
+        name: "{{ snowagent_service_name }}"
+        enabled: true
+        state: started
+
+    - name: Apply pending ACC installation and configuration handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for ACC service to stabilize
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify ACC service is active
+      ansible.builtin.command:
+        cmd: systemctl is-active "{{ snowagent_service_name }}"
+      register: snowagent_service_status
+      changed_when: false
+      failed_when: snowagent_service_status.stdout | trim != "active"
+
+    - name: Show ACC service status
+      ansible.builtin.debug:
+        msg: >-
+          {{ snowagent_service_name }} is
+          {{ snowagent_service_status.stdout | trim }}
+
+    - name: Refresh installed package facts for audit
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Refresh service facts for audit
+      ansible.builtin.service_facts:
+
+    - name: Ensure bootstrap asset audit directory exists
+      ansible.builtin.file:
+        path: /etc/hts/bootstrap/assets
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Build ServiceNow ACC bootstrap audit data
+      ansible.builtin.set_fact:
+        snowagent_bootstrap_audit:
+          asset: snow_acc
+          status: successful
+          environment: "{{ snowagent_environment }}"
+          policy_group: "{{ snowagent_policy_group }}"
+          configured_version: "{{ snowagent_version }}"
+          package_artifact: "{{ snowagent_package_name }}"
+          package_source: "{{ snowagent_package_source }}"
+          service: "{{ snowagent_service_name }}"
+          service_state: >-
+            {{
+              ansible_facts.services[snowagent_service_name].state
+              if snowagent_service_name in ansible_facts.services
+              else 'not found'
+            }}
+          service_status: "{{ snowagent_service_status.stdout | trim }}"
+          configuration_file: "{{ snowagent_config_file }}"
+          mid_port: "{{ snowagent_mid_port }}"
+          job_template: "{{ awx_job_template_name | default(tower_job_template_name | default('unknown')) }}"
+          job_id: "{{ awx_job_id | default(tower_job_id | default('unknown')) }}"
+          workflow_job_id: "{{ awx_workflow_job_id | default(tower_workflow_job_id | default('unknown')) }}"
+          project_revision: "{{ awx_project_revision | default(tower_project_revision | default('unknown')) }}"
+          inventory_hostname: "{{ inventory_hostname }}"
+          completed: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Record ServiceNow ACC bootstrap asset
+      ansible.builtin.copy:
+        dest: /etc/hts/bootstrap/assets/snow_acc.json
+        content: "{{ snowagent_bootstrap_audit | ansible.builtin.to_nice_json }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Validate ServiceNow ACC bootstrap audit JSON
+      ansible.builtin.command:
+        cmd: python3 -m json.tool /etc/hts/bootstrap/assets/snow_acc.json
+      changed_when: false
+
+  handlers:
+    - name: Restart ACC
+      ansible.builtin.systemd_service:
+        name: "{{ snowagent_service_name }}"
+        state: restarted
