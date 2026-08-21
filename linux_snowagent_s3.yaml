@@ -5,7 +5,7 @@
   gather_facts: true
 
   vars_files:
-    - vars/snowagent_s3.yaml
+    - vars/snowagent.yaml
 
   vars:
     snowagent_policy_group: "{{ policy_group | default('staging') }}"
