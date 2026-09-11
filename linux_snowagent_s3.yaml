@@ -31,15 +31,18 @@
     snowagent_version: >-
       {{ snowagent_acc_versions[snowagent_environment]['linux'] }}
 
-    snowagent_package_suffix: >-
-      {{
-        '-ubuntu-1804_amd64.deb'
-        if ansible_os_family == 'Debian'
-        else '-x86_64.rpm'
-      }}
+    snowagent_rpm_package_name: >-
+      {{ snowagent_package_prefix ~ snowagent_version ~ '-x86_64.rpm' }}
+
+    snowagent_debian_package_name: >-
+      {{ snowagent_package_prefix ~ snowagent_version ~ '-ubuntu-1804_amd64.deb' }}
 
     snowagent_package_name: >-
-      {{ snowagent_package_prefix ~ snowagent_version ~ snowagent_package_suffix }}
+      {{
+        snowagent_debian_package_name
+        if ansible_os_family == 'Debian'
+        else snowagent_rpm_package_name
+      }}
 
     snowagent_s3_object: >-
       {{ snowagent_s3_prefix }}/{{ snowagent_package_name }}
@@ -95,18 +98,22 @@
       become: false
       run_once: true
       register: snowagent_assumed_role
-      no_log: false
+      no_log: true
 
-    - name: Download ACC package from private S3 to execution node
+    - name: Download ACC packages from private S3 to execution node
       amazon.aws.s3_object:
         bucket: "{{ snowagent_s3_bucket }}"
-        object: "{{ snowagent_s3_object }}"
-        dest: "{{ snowagent_execution_package_file }}"
+        object: "{{ snowagent_s3_prefix }}/{{ item }}"
+        dest: "{{ snowagent_execution_package_dir }}/{{ item }}"
         mode: get
+        overwrite: different
         region: "{{ snowagent_s3_region }}"
         access_key: "{{ snowagent_assumed_role.sts_creds.access_key }}"
         secret_key: "{{ snowagent_assumed_role.sts_creds.secret_key }}"
         session_token: "{{ snowagent_assumed_role.sts_creds.session_token }}"
+      loop:
+        - "{{ snowagent_rpm_package_name }}"
+        - "{{ snowagent_debian_package_name }}"
       delegate_to: localhost
       become: false
       run_once: true
@@ -118,12 +125,25 @@
         dest: "{{ snowagent_install_file }}"
         mode: "0644"
 
-    - name: Install or upgrade ACC on RPM-based systems
+    - name: Install or upgrade ACC on DNF-based systems
       ansible.builtin.dnf:
         name: "{{ snowagent_install_file }}"
         state: present
         disable_gpg_check: true
-      when: ansible_os_family == "RedHat"
+        use_backend: dnf4
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_facts.pkg_mgr == "dnf"
+      notify: Restart ACC
+
+    - name: Install or upgrade ACC on Yum-based systems
+      ansible.builtin.yum:
+        name: "{{ snowagent_install_file }}"
+        state: present
+        disable_gpg_check: true
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_facts.pkg_mgr == "yum"
       notify: Restart ACC
 
     - name: Install or upgrade ACC on Debian-based systems
@@ -243,6 +263,19 @@
       ansible.builtin.command:
         cmd: python3 -m json.tool /etc/hts/bootstrap/assets/snow_acc.json
       changed_when: false
+
+    - name: Remove staged ACC package from managed host
+      ansible.builtin.file:
+        path: "{{ snowagent_install_file }}"
+        state: absent
+
+    - name: Remove temporary ACC package directory from execution node
+      ansible.builtin.file:
+        path: "{{ snowagent_execution_package_dir }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      run_once: true
 
   handlers:
     - name: Restart ACC
