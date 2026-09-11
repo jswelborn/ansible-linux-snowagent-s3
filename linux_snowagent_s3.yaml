@@ -134,7 +134,6 @@
       when:
         - ansible_os_family == "RedHat"
         - ansible_facts.pkg_mgr == "dnf"
-      notify: Restart ACC
 
     - name: Install or upgrade ACC on Yum-based systems
       ansible.builtin.yum:
@@ -144,14 +143,12 @@
       when:
         - ansible_os_family == "RedHat"
         - ansible_facts.pkg_mgr == "yum"
-      notify: Restart ACC
 
     - name: Install or upgrade ACC on Debian-based systems
       ansible.builtin.apt:
         deb: "{{ snowagent_install_file }}"
         state: present
       when: ansible_os_family == "Debian"
-      notify: Restart ACC
 
     - name: Ensure ACC configuration directory exists
       ansible.builtin.file:
@@ -180,17 +177,13 @@
         group: servicenow
         mode: "0600"
       when: snowagent_encrypted_key_check.rc != 0
-      notify: Restart ACC
       no_log: true
 
-    - name: Ensure ACC service is enabled and started
+    - name: Ensure ACC service is enabled and restarted after deployment
       ansible.builtin.systemd_service:
         name: "{{ snowagent_service_name }}"
         enabled: true
-        state: started
-
-    - name: Apply pending ACC installation and configuration handlers
-      ansible.builtin.meta: flush_handlers
+        state: restarted
 
     - name: Wait for ACC service to stabilize
       ansible.builtin.pause:
@@ -203,6 +196,15 @@
       changed_when: false
       failed_when: snowagent_service_status.stdout | trim != "active"
 
+    - name: Collect ACC service start timestamp
+      ansible.builtin.command:
+        cmd: >-
+          systemctl show "{{ snowagent_service_name }}"
+          --property=ExecMainStartTimestamp
+          --value
+      register: snowagent_service_start
+      changed_when: false
+
     - name: Show ACC service status
       ansible.builtin.debug:
         msg: >-
@@ -212,6 +214,15 @@
     - name: Refresh installed package facts for audit
       ansible.builtin.package_facts:
         manager: auto
+
+    - name: Set installed ACC package version for audit
+      ansible.builtin.set_fact:
+        snowagent_installed_version: >-
+          {{
+            ansible_facts.packages
+            .get('agent-client-collector', [{}])[0]
+            .get('version', 'not installed')
+          }}
 
     - name: Refresh service facts for audit
       ansible.builtin.service_facts:
@@ -232,6 +243,7 @@
           environment: "{{ snowagent_environment }}"
           policy_group: "{{ snowagent_policy_group }}"
           configured_version: "{{ snowagent_version }}"
+          installed_version: "{{ snowagent_installed_version }}"
           package_artifact: "{{ snowagent_package_name }}"
           package_source: "{{ snowagent_package_source }}"
           service: "{{ snowagent_service_name }}"
@@ -242,6 +254,7 @@
               else 'not found'
             }}
           service_status: "{{ snowagent_service_status.stdout | trim }}"
+          service_started: "{{ snowagent_service_start.stdout | trim }}"
           configuration_file: "{{ snowagent_config_file }}"
           mid_port: "{{ snowagent_mid_port }}"
           job_template: "{{ awx_job_template_name | default(tower_job_template_name | default('unknown')) }}"
@@ -276,9 +289,3 @@
       delegate_to: localhost
       become: false
       run_once: true
-
-  handlers:
-    - name: Restart ACC
-      ansible.builtin.systemd_service:
-        name: "{{ snowagent_service_name }}"
-        state: restarted
