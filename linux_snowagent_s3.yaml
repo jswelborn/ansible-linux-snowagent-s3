@@ -1,5 +1,5 @@
 ---
-- name: Install and configure ServiceNow ACC on Linux from S3
+- name: Clean install and configure ServiceNow ACC on Linux from S3
   hosts: all
   become: true
   gather_facts: true
@@ -11,6 +11,7 @@
     snowagent_policy_group: "{{ policy_group | default('staging') }}"
     snowagent_config_file: /etc/servicenow/agent-client-collector/acc.yml
     snowagent_service_name: acc.service
+    snowagent_package_id: agent-client-collector
     snowagent_working_dir: /tmp
     snowagent_execution_package_dir: /tmp/snowagent-s3
 
@@ -70,6 +71,63 @@
       ansible.builtin.meta: end_host
       when: ansible_architecture == "aarch64"
 
+    - name: Stop ACC service when present
+      ansible.builtin.systemd_service:
+        name: "{{ snowagent_service_name }}"
+        state: stopped
+      failed_when: false
+
+    - name: Disable ACC service when present
+      ansible.builtin.systemd_service:
+        name: "{{ snowagent_service_name }}"
+        enabled: false
+      failed_when: false
+
+    - name: Remove existing ACC package on DNF-based systems
+      ansible.builtin.dnf:
+        name: "{{ snowagent_package_id }}"
+        state: absent
+        use_backend: dnf4
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_facts.pkg_mgr == "dnf"
+
+    - name: Remove existing ACC package on Yum-based systems
+      ansible.builtin.yum:
+        name: "{{ snowagent_package_id }}"
+        state: absent
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_facts.pkg_mgr == "yum"
+
+    - name: Remove existing ACC package on Debian-based systems
+      ansible.builtin.apt:
+        name: "{{ snowagent_package_id }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when:
+        - ansible_os_family == "Debian"
+
+    - name: Remove existing ACC configuration and state
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/servicenow/agent-client-collector
+        - /var/cache/servicenow/agent-client-collector
+        - /var/lib/servicenow/agent-client-collector
+
+    - name: Remove remaining ACC systemd unit when present
+      ansible.builtin.file:
+        path: /usr/lib/systemd/system/acc.service
+        state: absent
+      failed_when: false
+
+    - name: Reload systemd after ACC removal
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
     - name: Ensure ServiceNow sudoers entry exists
       ansible.builtin.lineinfile:
         path: /etc/sudoers
@@ -125,7 +183,7 @@
         dest: "{{ snowagent_install_file }}"
         mode: "0644"
 
-    - name: Install or upgrade ACC on DNF-based systems
+    - name: Install ACC on DNF-based systems
       ansible.builtin.dnf:
         name: "{{ snowagent_install_file }}"
         state: present
@@ -135,7 +193,7 @@
         - ansible_os_family == "RedHat"
         - ansible_facts.pkg_mgr == "dnf"
 
-    - name: Install or upgrade ACC on Yum-based systems
+    - name: Install ACC on Yum-based systems
       ansible.builtin.yum:
         name: "{{ snowagent_install_file }}"
         state: present
@@ -144,11 +202,12 @@
         - ansible_os_family == "RedHat"
         - ansible_facts.pkg_mgr == "yum"
 
-    - name: Install or upgrade ACC on Debian-based systems
+    - name: Install ACC on Debian-based systems
       ansible.builtin.apt:
         deb: "{{ snowagent_install_file }}"
         state: present
-      when: ansible_os_family == "Debian"
+      when:
+        - ansible_os_family == "Debian"
 
     - name: Ensure ACC configuration directory exists
       ansible.builtin.file:
@@ -158,32 +217,20 @@
         group: servicenow
         mode: "0755"
 
-    - name: Check whether acc.yml already contains encrypted API key
-      ansible.builtin.shell: |
-        set -o pipefail
-        grep -Ei '^\s*api-key:\s*"(encrypted:)' \
-          "{{ snowagent_config_file }}"
-      args:
-        executable: /bin/bash
-      register: snowagent_encrypted_key_check
-      changed_when: false
-      failed_when: false
-
-    - name: Deploy ACC configuration when API key is not already encrypted
+    - name: Deploy ACC configuration
       ansible.builtin.template:
         src: acc.yaml.j2
         dest: "{{ snowagent_config_file }}"
         owner: servicenow
         group: servicenow
         mode: "0600"
-      when: snowagent_encrypted_key_check.rc != 0
       no_log: true
 
-    - name: Ensure ACC service is enabled and restarted after deployment
+    - name: Ensure ACC service is enabled and started
       ansible.builtin.systemd_service:
         name: "{{ snowagent_service_name }}"
         enabled: true
-        state: restarted
+        state: started
 
     - name: Wait for ACC service to stabilize
       ansible.builtin.pause:
@@ -220,7 +267,7 @@
         snowagent_installed_version: >-
           {{
             ansible_facts.packages
-            .get('agent-client-collector', [{}])[0]
+            .get(snowagent_package_id, [{}])[0]
             .get('version', 'not installed')
           }}
 
@@ -257,10 +304,38 @@
           service_started: "{{ snowagent_service_start.stdout | trim }}"
           configuration_file: "{{ snowagent_config_file }}"
           mid_port: "{{ snowagent_mid_port }}"
-          job_template: "{{ awx_job_template_name | default(tower_job_template_name | default('unknown')) }}"
-          job_id: "{{ awx_job_id | default(tower_job_id | default('unknown')) }}"
-          workflow_job_id: "{{ awx_workflow_job_id | default(tower_workflow_job_id | default('unknown')) }}"
-          project_revision: "{{ awx_project_revision | default(tower_project_revision | default('unknown')) }}"
+          job_template: >-
+            {{
+              awx_job_template_name
+              | default(
+                  tower_job_template_name
+                  | default('unknown')
+                )
+            }}
+          job_id: >-
+            {{
+              awx_job_id
+              | default(
+                  tower_job_id
+                  | default('unknown')
+                )
+            }}
+          workflow_job_id: >-
+            {{
+              awx_workflow_job_id
+              | default(
+                  tower_workflow_job_id
+                  | default('unknown')
+                )
+            }}
+          project_revision: >-
+            {{
+              awx_project_revision
+              | default(
+                  tower_project_revision
+                  | default('unknown')
+                )
+            }}
           inventory_hostname: "{{ inventory_hostname }}"
           completed: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
 
